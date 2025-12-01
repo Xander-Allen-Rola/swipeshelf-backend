@@ -69,7 +69,7 @@ const fetchBooksFromGoogle = async (query: string, maxResults = 20) => {
 
   // Fetch covers in parallel
   const books = await Promise.all(
-    metadata.map(async (meta) => {
+    metadata.map(async (meta: any) => {
       const coverUrl = await fetchCoverWithLimit(meta.title, meta.authorsList[0] || "");
       if (!coverUrl || !meta.description) return null;
 

@@ -23,7 +23,7 @@ const authenticateToken = (req: any, res: any, next: any) => {
 /**
  * 📝 PUT /users/update — Update first name, last name, bio
  */
-router.put("/update", authenticateToken, async (req, res) => {
+router.put("/update", authenticateToken, async (req: any, res) => {
   try {
     const { firstName, lastName, bio } = req.body;
 
@@ -52,7 +52,7 @@ router.put("/update", authenticateToken, async (req, res) => {
 /**
  * 🖼️ PUT /users/profile-picture — Update only profile picture URL
  */
-router.put("/profile-picture", authenticateToken, async (req, res) => {
+router.put("/profile-picture", authenticateToken, async (req: any, res) => {
   try {
     const { url } = req.body;
 

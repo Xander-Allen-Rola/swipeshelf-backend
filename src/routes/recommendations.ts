@@ -229,8 +229,8 @@ router.get("/fetch/:userId", async (req, res) => {
     let genreIndex = Math.floor(Math.random() * genreIds.length);
 
     while (finalRecommendations.length < 20 && genreIds.length > 0) {
-      const currentGenreId = genreIds[genreIndex];
-      const pool = genreBookPool[currentGenreId];
+      const currentGenreId = genreIds[genreIndex]!;
+      const pool = genreBookPool[currentGenreId]!;
 
       if (pool.length > 0) {
         finalRecommendations.push(pool.shift());

@@ -27,6 +27,9 @@ app.use("/api/markSeen", markSeenRouter);
 app.use("/api/shelves", shelvesRouter);
 app.use("/api/search", search);
 
-app.listen(5000, () => {
-  console.log("✅ Backend running on http://localhost:5000");
+const PORT = parseInt(process.env.PORT || "5000", 10);
+const HOST = process.env.HOST || "0.0.0.0";
+
+app.listen(PORT, HOST, () => {
+  console.log(`✅ Backend running on http://${HOST}:${PORT}`);
 });

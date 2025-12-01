@@ -24,14 +24,14 @@ router.post("/user", async (req, res) => {
 
   try {
     // Remove previous selections
-    await prisma.userGenres.deleteMany({ where: { userId } });
+    await prisma.userGenre.deleteMany({ where: { userId } });
 
     // Insert new selections
     const newUserGenres = genreIds.map((genreId: number) => ({
       userId,
       genreId,
     }));
-    await prisma.userGenres.createMany({ data: newUserGenres });
+    await prisma.userGenre.createMany({ data: newUserGenres });
 
     res.json({ message: "User genres updated successfully" });
   } catch (err) {
