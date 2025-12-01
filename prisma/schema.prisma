@@ -1,0 +1,88 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id             Int        @id @default(autoincrement())
+  email          String     @unique
+  password       String
+  firstName      String
+  lastName       String
+  suffix         String?
+  dob            DateTime?
+  profilePicture String?
+  bio            String? 
+  createdAt      DateTime   @default(now())
+
+  genres         UserGenre[]
+  userBooks      UserBook[]
+  shelves        Shelf[]
+}
+
+model Genre {
+  id     Int         @id @default(autoincrement())
+  name   String      @unique
+
+  users  UserGenre[]
+}
+
+model UserGenre {
+  id       Int    @id @default(autoincrement())
+  userId   Int
+  genreId  Int
+
+  user     User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  genre    Genre  @relation(fields: [genreId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, genreId])
+}
+
+model Book {
+  id            Int     @id @default(autoincrement())
+  googleBooksId String  @unique
+
+  userBooks     UserBook[]
+  shelfBooks    ShelfBook[] 
+}
+
+model UserBook {
+  id       Int   @id @default(autoincrement())
+  userId   Int
+  bookId   Int
+
+  user     User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  book     Book @relation(fields: [bookId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, bookId])
+}
+
+model Shelf {
+  id        Int          @id @default(autoincrement())
+  userId    Int
+  name      String
+  createdAt DateTime     @default(now())
+
+  user      User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  books     ShelfBook[]
+}
+
+model ShelfBook {
+  id       Int      @id @default(autoincrement())
+  shelfId  Int
+  bookId   Int
+  status   String?   // e.g. "reading", "completed", "to-read"
+  addedAt  DateTime  @default(now())
+  title      String
+  coverURL   String
+  description String
+
+  shelf    Shelf    @relation(fields: [shelfId], references: [id], onDelete: Cascade)
+  book     Book     @relation(fields: [bookId], references: [id], onDelete: Cascade)
+
+  @@unique([shelfId, bookId]) // prevent duplicates in the same shelf
+}
