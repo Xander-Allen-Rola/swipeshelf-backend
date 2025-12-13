@@ -59,8 +59,6 @@ The backend is a REST API built with Express and written in TypeScript.
 npm install
 ```
 
-## Running the Server
-
 ##Development
 
 ```bash
