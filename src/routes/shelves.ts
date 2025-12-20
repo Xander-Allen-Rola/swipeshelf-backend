@@ -1,8 +1,10 @@
 import { Router } from "express";
 import prisma from "../prisma";
 import jwt from "jsonwebtoken";
+import axios from "axios";
 
 const router = Router();
+const GOOGLE_API_KEY = process.env.GOOGLE_BOOKS_API_KEY;
 
 const authenticateToken = (req: any, res: any, next: any) => {
   const authHeader = req.headers["authorization"];
@@ -15,6 +17,81 @@ const authenticateToken = (req: any, res: any, next: any) => {
     req.userId = user.userId; // attach userId to request
     next();
   });
+};
+
+/**
+ * Helper: Detect genre for a book by fetching from Google Books API
+ * and matching categories to existing Genre records
+ */
+const detectBookGenre = async (googleBooksId: string): Promise<number | null> => {
+  try {
+    // Fetch book metadata from Google Books API
+    const response = await axios.get(
+      `https://www.googleapis.com/books/v1/volumes/${googleBooksId}`,
+      { params: { key: GOOGLE_API_KEY } }
+    );
+
+    const categories = response.data.volumeInfo?.categories || [];
+    if (categories.length === 0) {
+      console.log(`📚 No categories found for book ${googleBooksId}`);
+      return null;
+    }
+
+    console.log(`📚 Book ${googleBooksId} has categories:`, categories);
+
+    // Fetch all genres from database
+    const genres = await prisma.genre.findMany();
+    if (genres.length === 0) {
+      console.warn(`⚠️ No genres found in database`);
+      return null;
+    }
+
+    // Try to match a category to a genre (case-insensitive)
+    for (const category of categories) {
+      const categoryLower = category.toLowerCase();
+      
+      // Extract key words from category (split on common separators)
+      const categoryWords = categoryLower
+        .split(/[\/&\-,]/)
+        .map(w => w.trim())
+        .filter(w => w.length > 2); // ignore short words like "of", "a", etc.
+
+      const matchedGenre = genres.find((g) => {
+        const genreLower = g.name.toLowerCase();
+        const genreWords = genreLower
+          .split(/[\/&\-,]/)
+          .map(w => w.trim())
+          .filter(w => w.length > 2);
+
+        // Check for exact substring match first (original logic)
+        if (categoryLower.includes(genreLower) || genreLower.includes(categoryLower)) {
+          return true;
+        }
+
+        // Check if any genre word appears in any category word
+        for (const genreWord of genreWords) {
+          for (const categoryWord of categoryWords) {
+            if (categoryWord.includes(genreWord) || genreWord.includes(categoryWord)) {
+              return true;
+            }
+          }
+        }
+
+        return false;
+      });
+
+      if (matchedGenre) {
+        console.log(`✅ Matched genre "${matchedGenre.name}" (ID: ${matchedGenre.id}) for category "${category}"`);
+        return matchedGenre.id;
+      }
+    }
+
+    console.log(`❌ No genre match found for book ${googleBooksId}. Categories:`, categories);
+    return null;
+  } catch (err: any) {
+    console.warn(`⚠️ Failed to detect genre for ${googleBooksId}:`, err?.message);
+    return null;
+  }
 };
 
 /**
@@ -40,15 +117,29 @@ router.post("/add-to-to-read", authenticateToken, async (req, res) => {
       });
     }
 
-    // 2️⃣ Find or create the book
+    // 2️⃣ Find or create the book with genre detection
     let dbBook = await prisma.book.findUnique({
       where: { googleBooksId: book.googleBooksId },
     });
 
     if (!dbBook) {
+      // Detect genre from Google Books API
+      const genreId = await detectBookGenre(book.googleBooksId);
       dbBook = await prisma.book.create({
-        data: { googleBooksId: book.googleBooksId },
+        data: { 
+          googleBooksId: book.googleBooksId,
+          genreId: genreId,
+        },
       });
+    } else if (!dbBook.genreId) {
+      // If book exists but has no genre, try to set it
+      const genreId = await detectBookGenre(book.googleBooksId);
+      if (genreId) {
+        dbBook = await prisma.book.update({
+          where: { id: dbBook.id },
+          data: { genreId },
+        });
+      }
     }
 
     // 3️⃣ Check if the book is in "Finished" shelf
@@ -122,15 +213,29 @@ router.post("/add-to-finished", authenticateToken, async (req, res) => {
       });
     }
 
-    // 2️⃣ Find or create the book
+    // 2️⃣ Find or create the book with genre detection
     let dbBook = await prisma.book.findUnique({
       where: { googleBooksId: book.googleBooksId },
     });
 
     if (!dbBook) {
+      // Detect genre from Google Books API
+      const genreId = await detectBookGenre(book.googleBooksId);
       dbBook = await prisma.book.create({
-        data: { googleBooksId: book.googleBooksId },
+        data: { 
+          googleBooksId: book.googleBooksId,
+          genreId: genreId,
+        },
       });
+    } else if (!dbBook.genreId) {
+      // If book exists but has no genre, try to set it
+      const genreId = await detectBookGenre(book.googleBooksId);
+      if (genreId) {
+        dbBook = await prisma.book.update({
+          where: { id: dbBook.id },
+          data: { genreId },
+        });
+      }
     }
 
     // 3️⃣ Check if the book is in "To Read" shelf
@@ -426,17 +531,29 @@ router.post("/add-to-favorites", authenticateToken, async (req, res) => {
     for (const b of booksToAdd) {
       if (!b?.googleBooksId) continue;
 
-      // 🪄 Find or create the book
+      // 🪄 Find or create the book with genre detection
       let dbBook = await prisma.book.findUnique({
         where: { googleBooksId: b.googleBooksId },
       });
 
       if (!dbBook) {
+        // Detect genre from Google Books API
+        const genreId = await detectBookGenre(b.googleBooksId);
         dbBook = await prisma.book.create({
           data: {
             googleBooksId: b.googleBooksId,
+            genreId: genreId,
           },
         });
+      } else if (!dbBook.genreId) {
+        // If book exists but has no genre, try to set it
+        const genreId = await detectBookGenre(b.googleBooksId);
+        if (genreId) {
+          dbBook = await prisma.book.update({
+            where: { id: dbBook.id },
+            data: { genreId },
+          });
+        }
       }
 
       // 4️⃣ Upsert into shelfBook

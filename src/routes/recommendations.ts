@@ -233,7 +233,19 @@ router.get("/fetch/:userId", async (req, res) => {
       const pool = genreBookPool[currentGenreId]!;
 
       if (pool.length > 0) {
-        finalRecommendations.push(pool.shift());
+        const rec = pool.shift()!;
+        // ✅ Persist the genre used to fetch this recommendation
+        try {
+          await prisma.book.upsert({
+            where: { googleBooksId: rec.googleBooksId },
+            create: { googleBooksId: rec.googleBooksId, genreId: currentGenreId },
+            update: { genreId: currentGenreId },
+          });
+        } catch (e) {
+          console.warn(`⚠️ Failed to set genreId for book ${rec.googleBooksId}:`, (e as any)?.message);
+        }
+
+        finalRecommendations.push(rec);
       }
 
       // If pool runs out, remove genre from rotation
