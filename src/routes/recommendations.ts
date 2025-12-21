@@ -9,6 +9,25 @@ const limit = pLimit(5); // max 5 concurrent Open Library requests
 const router = Router();
 const GOOGLE_API_KEY = process.env.GOOGLE_BOOKS_API_KEY;
 
+type CandidateBook = {
+  title: string;
+  authors: string;
+  publishedDate: number | null;
+  isbn: string | null;
+  coverUrl: string;
+  googleBooksId: string;
+  description: string;
+  averageRating: number;
+  categories: string[];
+  sourceGenreId?: number;
+};
+
+type ShelfBookLite = {
+  googleBooksId: string;
+  title: string;
+  description: string;
+};
+
 // Helper: fetch books for a query
 // Helper: truncate description to N words
 const truncateDescription = (text: string, wordLimit = 150) => {
@@ -93,6 +112,68 @@ const fetchBooksFromGoogle = async (query: string, maxResults = 20) => {
   );
 
   return books.filter(Boolean);
+};
+
+const tokenize = (text: string): Set<string> => {
+  return new Set(
+    text
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, " ")
+      .split(/\s+/)
+      .map((t) => t.trim())
+      .filter((t) => t.length >= 3)
+  );
+};
+
+const jaccardSimilarity = (a: Set<string>, b: Set<string>): number => {
+  if (a.size === 0 || b.size === 0) return 0;
+  let intersection = 0;
+  for (const x of a) {
+    if (b.has(x)) intersection += 1;
+  }
+  const union = a.size + b.size - intersection;
+  return union === 0 ? 0 : intersection / union;
+};
+
+const bookToText = (book: { title?: string; authors?: string; description?: string; categories?: string[] }) => {
+  const parts = [book.title ?? "", book.authors ?? "", book.description ?? "", (book.categories ?? []).join(" ")];
+  return parts.filter(Boolean).join(" ");
+};
+
+const normalizeKeyPart = (value: string) => {
+  return value
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, " ");
+};
+
+const normalizedCandidateKey = (book: CandidateBook): string => {
+  const title = normalizeKeyPart(book.title ?? "");
+  const author = normalizeKeyPart((book.authors ?? "").split(",")[0] ?? "");
+  if (title && author) return `${title}|${author}`;
+  if (title) return `${title}|unknown-author`;
+  return `id|${book.googleBooksId}`;
+};
+
+type SimilarityDetail = {
+  score: number;
+  matchedIndex: number;
+};
+
+const maxSimilarityToShelfDetailed = (
+  candidateTokens: Set<string>,
+  shelfTokenSets: Set<string>[]
+): SimilarityDetail => {
+  let best = 0;
+  let matchedIndex = -1;
+  for (let i = 0; i < shelfTokenSets.length; i += 1) {
+    const sim = jaccardSimilarity(candidateTokens, shelfTokenSets[i]!);
+    if (sim > best) {
+      best = sim;
+      matchedIndex = i;
+    }
+  }
+  return { score: best, matchedIndex };
 };
 
 /** Get books from the "To Read" shelf for a user */
@@ -193,78 +274,253 @@ router.get("/fetch/:userId", async (req, res) => {
       return res.status(200).json({ message: "User has no selected genres" });
     }
 
-    // 1️⃣ Fetch candidate books for each genre and store them in pools
-    const genreBookPool: Record<number, any[]> = {};
+    console.log(`\n==============================`);
+    console.log(`📌 Recommendations requested for userId=${userId}`);
+
+    // User signals
+    const preferredGenreIds = new Set<number>(userGenres.map((ug) => ug.genreId));
+    console.log(
+      `📚 Preferred genres (${userGenres.length}): ${userGenres
+        .map((ug) => `${ug.genre.name}#${ug.genreId}`)
+        .join(", ")}`
+    );
+
+    // Shelf context for similarity + exclusion
+    const [toRead, finished] = await Promise.all([
+      getToReadBooks(userId),
+      getFinishedBooks(userId),
+    ]);
+
+    console.log(`📖 Shelf counts: toRead=${toRead.length}, finished=${finished.length}`);
+
+    const toReadLite: ShelfBookLite[] = toRead
+      .map((b) => ({
+        googleBooksId: b.googleBooksId,
+        title: b.title ?? "",
+        description: b.description ?? "",
+      }))
+      .filter((b) => !!b.googleBooksId);
+
+    const finishedLite: ShelfBookLite[] = finished
+      .map((b) => ({
+        googleBooksId: b.googleBooksId,
+        title: b.title ?? "",
+        description: b.description ?? "",
+      }))
+      .filter((b) => !!b.googleBooksId);
+
+    const excludeGoogleIds = new Set<string>([
+      ...toReadLite.map((b) => b.googleBooksId),
+      ...finishedLite.map((b) => b.googleBooksId),
+    ]);
+
+    // Also exclude books the user has explicitly marked/seen
+    const seen = await prisma.userBook.findMany({
+      where: { userId },
+      include: { book: true },
+    });
+    for (const ub of seen) {
+      if (ub.book?.googleBooksId) excludeGoogleIds.add(ub.book.googleBooksId);
+    }
+
+    console.log(`👁️ UserBook(seen) count=${seen.length}; total excluded googleBooksId=${excludeGoogleIds.size}`);
+
+    const toReadTokenSets = toReadLite.map((b) => tokenize(bookToText(b)));
+    const finishedTokenSets = finishedLite.map((b) => tokenize(bookToText(b)));
+
+    const weights = finishedLite.length > 0
+      ? { genre: 0.35, finished: 0.40, toRead: 0.25 }
+      : { genre: 0.70, finished: 0.20, toRead: 0.10 };
+    console.log(
+      `⚖️ Weights applied: genre=${weights.genre.toFixed(2)} finished=${weights.finished.toFixed(
+        2
+      )} toRead=${weights.toRead.toFixed(2)} (finishedBooks=${finishedLite.length})`
+    );
+
+    // 1️⃣ Fetch candidate books per preferred genre (dedupe BEFORE scoring)
+    // Key: normalized title + author (fallback googleBooksId)
+    const candidateMap = new Map<string, CandidateBook>();
+    let fetchedTotal = 0;
+    let skippedExcluded = 0;
+    let skippedMissingId = 0;
+    let dedupedCollisions = 0;
     for (const ug of userGenres) {
-      const rawBooks = await fetchBooksFromGoogle(`subject:${ug.genre.name}`, 40);
-      const filtered: any[] = [];
-
+      const rawBooks = (await fetchBooksFromGoogle(`subject:${ug.genre.name}`, 40)) as CandidateBook[];
+      fetchedTotal += rawBooks.length;
       for (const book of rawBooks) {
-        // Skip duplicates in pool
-        if (filtered.find((b) => b.googleBooksId === book.googleBooksId)) continue;
+        if (!book?.googleBooksId) {
+          skippedMissingId += 1;
+          continue;
+        }
+        if (excludeGoogleIds.has(book.googleBooksId)) {
+          skippedExcluded += 1;
+          continue;
+        }
 
-        // Check DB if book already exists and if user has interacted with it
-        const bookRecord = await prisma.book.findUnique({
-          where: { googleBooksId: book.googleBooksId },
+        const candidate: CandidateBook = { ...book, sourceGenreId: ug.genre.id };
+        const key = normalizedCandidateKey(candidate);
+        const existingCandidate = candidateMap.get(key);
+        if (!existingCandidate) {
+          candidateMap.set(key, candidate);
+          continue;
+        }
+
+        // Collision: same normalized key (likely the same book with different Google Books IDs)
+        dedupedCollisions += 1;
+        console.log(
+          `🧩 Deduped candidate key="${key}" kept=${existingCandidate.googleBooksId} dropped=${candidate.googleBooksId}`
+        );
+
+        // Heuristic: keep the one with higher rating; if tied, keep the longer description.
+        const existingRating = existingCandidate.averageRating ?? 0;
+        const incomingRating = candidate.averageRating ?? 0;
+        const existingDescLen = (existingCandidate.description ?? "").length;
+        const incomingDescLen = (candidate.description ?? "").length;
+
+        const shouldReplace =
+          incomingRating > existingRating ||
+          (incomingRating === existingRating && incomingDescLen > existingDescLen);
+
+        if (shouldReplace) {
+          candidateMap.set(key, candidate);
+          console.log(
+            `   ↳ replaced kept=${existingCandidate.googleBooksId} with=${candidate.googleBooksId} (rating ${existingRating}→${incomingRating}, descLen ${existingDescLen}→${incomingDescLen})`
+          );
+        }
+      }
+    }
+
+    const candidates = Array.from(candidateMap.values());
+    console.log(
+      `🧪 Candidate fetch summary: fetchedTotal=${fetchedTotal}, uniqueCandidates=${candidates.length}, skippedExcluded=${skippedExcluded}, skippedMissingId=${skippedMissingId}, dedupedCollisions=${dedupedCollisions}`
+    );
+    if (candidates.length === 0) {
+      return res.status(200).json([]);
+    }
+
+    // 2️⃣ Pull any existing DB genres for candidates (authoritative)
+    const existing = await prisma.book.findMany({
+      where: { googleBooksId: { in: candidates.map((c) => c.googleBooksId) } },
+      select: { googleBooksId: true, genreId: true },
+    });
+    const existingGenreByGoogleId = new Map<string, number | null>(
+      existing.map((b) => [b.googleBooksId, b.genreId ?? null])
+    );
+
+    // 3️⃣ Score candidates
+    console.log(`🧮 Scoring ${candidates.length} candidates...`);
+
+    const scored = candidates.map((c) => {
+      const dbGenreId = existingGenreByGoogleId.get(c.googleBooksId) ?? null;
+      const genreId = dbGenreId ?? c.sourceGenreId ?? null;
+
+      // book.genres is effectively a single-genre list (genreId FK)
+      const totalGenres = genreId ? 1 : 0;
+      const matchedGenres = genreId && preferredGenreIds.has(genreId) ? 1 : 0;
+      const genreOverlapRatio = totalGenres > 0 ? matchedGenres / totalGenres : 0;
+      const genreScore = totalGenres > 0 ? 0.6 + 0.4 * genreOverlapRatio : 0;
+
+      const candidateTokens = tokenize(bookToText(c));
+      const finishedDetail = maxSimilarityToShelfDetailed(candidateTokens, finishedTokenSets);
+      const toReadDetail = maxSimilarityToShelfDetailed(candidateTokens, toReadTokenSets);
+
+      const finishedScore = finishedDetail.score;
+      const toReadScore = toReadDetail.score;
+
+      const score =
+        weights.genre * genreScore +
+        weights.finished * finishedScore +
+        weights.toRead * toReadScore;
+
+      const dbVsSource = dbGenreId
+        ? `dbGenreId=${dbGenreId}`
+        : c.sourceGenreId
+          ? `sourceGenreId=${c.sourceGenreId}`
+          : `noGenreId`;
+
+      const finishedMatch =
+        finishedDetail.matchedIndex >= 0
+          ? finishedLite[finishedDetail.matchedIndex]
+          : null;
+
+      const toReadMatch =
+        toReadDetail.matchedIndex >= 0
+          ? toReadLite[toReadDetail.matchedIndex]
+          : null;
+
+      const key = normalizedCandidateKey(c);
+      console.log(
+        `🧾 Score breakdown | key="${key}" | ${c.googleBooksId} | "${c.title}" | ${dbVsSource} | ` +
+          `genreOverlap=${matchedGenres}/${totalGenres}=${genreOverlapRatio.toFixed(2)} ` +
+          `genreScore=${genreScore.toFixed(3)} finishedScore=${finishedScore.toFixed(3)} toReadScore=${toReadScore.toFixed(
+            3
+          )} | ` +
+          `weights(g=${weights.genre.toFixed(2)},f=${weights.finished.toFixed(2)},t=${weights.toRead.toFixed(
+            2
+          )}) => total=${score.toFixed(3)}`
+      );
+      if (finishedMatch) {
+        console.log(
+          `   ↳ bestFinished match sim=${finishedScore.toFixed(3)} vs ${finishedMatch.googleBooksId} | "${finishedMatch.title}"`
+        );
+      }
+      if (toReadMatch) {
+        console.log(
+          `   ↳ bestToRead  match sim=${toReadScore.toFixed(3)} vs ${toReadMatch.googleBooksId} | "${toReadMatch.title}"`
+        );
+      }
+
+      return {
+        candidate: c,
+        score,
+        genreId,
+        genreScore,
+        genreOverlapRatio,
+        finishedScore,
+        toReadScore,
+        weights,
+      };
+    });
+
+    scored.sort((a, b) => b.score - a.score);
+    const top = scored.slice(0, 20);
+
+    console.log(`🏁 Top ${top.length} recommendations:`);
+    top.forEach((r, idx) => {
+      console.log(
+        `   #${idx + 1} total=${r.score.toFixed(3)} ` +
+          `(genre=${r.genreScore.toFixed(3)} finished=${r.finishedScore.toFixed(3)} toRead=${r.toReadScore.toFixed(
+            3
+          )}) ` +
+          `weights(g=${r.weights.genre.toFixed(2)},f=${r.weights.finished.toFixed(2)},t=${r.weights.toRead.toFixed(
+            2
+          )}) ` +
+          `genreId=${r.genreId ?? "null"} | ${r.candidate.googleBooksId} | "${r.candidate.title}"`
+      );
+    });
+
+    // 4️⃣ Persist genreId for returned recommendations
+    for (const r of top) {
+      if (!r.genreId) continue;
+      try {
+        await prisma.book.upsert({
+          where: { googleBooksId: r.candidate.googleBooksId },
+          create: { googleBooksId: r.candidate.googleBooksId, genreId: r.genreId },
+          update: { genreId: r.genreId },
         });
-
-        if (bookRecord) {
-          const alreadyUserBook = await prisma.userBook.findUnique({
-            where: { userId_bookId: { userId, bookId: bookRecord.id } },
-          });
-          if (alreadyUserBook) continue;
-        }
-
-        filtered.push(book);
-      }
-
-      genreBookPool[ug.genre.id] = filtered;
-    }
-
-    // 2️⃣ Alternate between genres in round-robin fashion
-    const finalRecommendations: any[] = [];
-    const genreIds = userGenres.map((ug) => ug.genre.id);
-
-    // 🎲 Randomize starting genre
-    let genreIndex = Math.floor(Math.random() * genreIds.length);
-
-    while (finalRecommendations.length < 20 && genreIds.length > 0) {
-      const currentGenreId = genreIds[genreIndex]!;
-      const pool = genreBookPool[currentGenreId]!;
-
-      if (pool.length > 0) {
-        const rec = pool.shift()!;
-        // ✅ Persist the genre used to fetch this recommendation
-        try {
-          await prisma.book.upsert({
-            where: { googleBooksId: rec.googleBooksId },
-            create: { googleBooksId: rec.googleBooksId, genreId: currentGenreId },
-            update: { genreId: currentGenreId },
-          });
-        } catch (e) {
-          console.warn(`⚠️ Failed to set genreId for book ${rec.googleBooksId}:`, (e as any)?.message);
-        }
-
-        finalRecommendations.push(rec);
-      }
-
-      // If pool runs out, remove genre from rotation
-      if (pool.length === 0) {
-        genreIds.splice(genreIndex, 1);
-        if (genreIds.length === 0) break;
-        genreIndex = genreIndex % genreIds.length;
-      } else {
-        genreIndex = (genreIndex + 1) % genreIds.length;
+        console.log(
+          `💾 Persisted genreId=${r.genreId} for ${r.candidate.googleBooksId} ("${r.candidate.title}")`
+        );
+      } catch (e) {
+        console.warn(
+          `⚠️ Failed to set genreId for book ${r.candidate.googleBooksId}:`,
+          (e as any)?.message
+        );
       }
     }
 
-    
-  // 🔹 Log if we ran out of books before reaching 20 recommendations
-  if (finalRecommendations.length < 20) {
-    console.log(`⚠️ Ran out of books to recommend. Only ${finalRecommendations.length} available.`);
-  }
-
-    res.status(200).json(finalRecommendations);
+    // Keep response shape the same as before (just the book objects)
+    res.status(200).json(top.map((r) => r.candidate));
   } catch (err: any) {
     console.error(
       "❌ Error fetching recommendations:",
