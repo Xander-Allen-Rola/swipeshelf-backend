@@ -20,6 +20,7 @@ type CandidateBook = {
   averageRating: number;
   categories: string[];
   sourceGenreId?: number;
+  sourceGenreName?: string;
 };
 
 type ShelfBookLite = {
@@ -357,7 +358,11 @@ router.get("/fetch/:userId", async (req, res) => {
           continue;
         }
 
-        const candidate: CandidateBook = { ...book, sourceGenreId: ug.genre.id };
+        const candidate: CandidateBook = {
+          ...book,
+          sourceGenreId: ug.genre.id,
+          sourceGenreName: ug.genre.name,
+        };
         const key = normalizedCandidateKey(candidate);
         const existingCandidate = candidateMap.get(key);
         if (!existingCandidate) {

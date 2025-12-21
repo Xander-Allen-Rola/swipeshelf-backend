@@ -1,10 +1,56 @@
 import { Router } from "express";
 import axios from "axios";
 import pLimit from "p-limit";
+import prisma from "../prisma";
 
 const router = Router();
 const GOOGLE_API_KEY = process.env.GOOGLE_BOOKS_API_KEY;
 const limit = pLimit(5); // max 5 concurrent Open Library requests
+
+type GenreLite = { id: number; name: string };
+
+const matchGenreFromCategories = (
+  categories: string[],
+  genres: GenreLite[]
+): GenreLite | null => {
+  if (!categories?.length || !genres?.length) return null;
+
+  for (const category of categories) {
+    const categoryLower = String(category).toLowerCase();
+    const categoryWords = categoryLower
+      .split(/[\/&\-,]/)
+      .map((w) => w.trim())
+      .filter((w) => w.length > 2);
+
+    const matchedGenre = genres.find((g) => {
+      const genreLower = g.name.toLowerCase();
+      const genreWords = genreLower
+        .split(/[\/&\-,]/)
+        .map((w) => w.trim())
+        .filter((w) => w.length > 2);
+
+      // Exact substring match
+      if (categoryLower.includes(genreLower) || genreLower.includes(categoryLower)) {
+        return true;
+      }
+
+      // Word overlap-ish match
+      for (const genreWord of genreWords) {
+        for (const categoryWord of categoryWords) {
+          if (categoryWord.includes(genreWord) || genreWord.includes(categoryWord)) {
+            return true;
+          }
+        }
+      }
+
+      return false;
+    });
+
+    if (matchedGenre) return matchedGenre;
+  }
+
+  return null;
+};
 
 // 📝 Truncate Description
 const truncateDescription = (text: string, wordLimit = 150) => {
@@ -43,7 +89,11 @@ const fetchCoverWithLimit = (title: string, author: string) =>
   limit(() => fetchOpenLibraryCover(title, author));
 
 // 📖 Fetch books from Google API
-const fetchBooksFromGoogle = async (query: string, maxResults = 20) => {
+const fetchBooksFromGoogle = async (
+  query: string,
+  maxResults = 20,
+  genres: GenreLite[] = []
+) => {
   const res = await axios.get("https://www.googleapis.com/books/v1/volumes", {
     params: { q: query, maxResults, key: GOOGLE_API_KEY },
   });
@@ -76,6 +126,8 @@ const fetchBooksFromGoogle = async (query: string, maxResults = 20) => {
       const forbidden = ["annotated", "illustrated"];
       if (forbidden.some((w) => meta.title.toLowerCase().includes(w))) return null;
 
+      const matchedGenre = matchGenreFromCategories(meta.categories || [], genres);
+
       return {
         title: meta.title,
         authors: meta.authorsList.join(", ") || "Unknown",
@@ -86,6 +138,8 @@ const fetchBooksFromGoogle = async (query: string, maxResults = 20) => {
         description: truncateDescription(meta.description, 150),
         averageRating: meta.averageRating,
         categories: meta.categories,
+        sourceGenreId: matchedGenre?.id ?? null,
+        sourceGenreName: matchedGenre?.name ?? null,
       };
     })
   );
@@ -116,7 +170,8 @@ router.get("/search", async (req, res) => {
   if (!query) return res.status(400).json({ error: "Missing query" });
 
   try {
-    const books = await fetchBooksFromGoogle(query, 20);
+    const genres = await prisma.genre.findMany({ select: { id: true, name: true } });
+    const books = await fetchBooksFromGoogle(query, 20, genres);
     res.json(books);
   } catch (err: any) {
     console.error("❌ Search error:", err.message);
