@@ -53,15 +53,15 @@ const detectBookGenre = async (googleBooksId: string): Promise<number | null> =>
       // Extract key words from category (split on common separators)
       const categoryWords = categoryLower
         .split(/[\/&\-,]/)
-        .map(w => w.trim())
-        .filter(w => w.length > 2); // ignore short words like "of", "a", etc.
+        .map((w: string) => w.trim())
+        .filter((w: string) => w.length > 2); // ignore short words like "of", "a", etc.
 
       const matchedGenre = genres.find((g) => {
         const genreLower = g.name.toLowerCase();
         const genreWords = genreLower
           .split(/[\/&\-,]/)
-          .map(w => w.trim())
-          .filter(w => w.length > 2);
+          .map((w: string) => w.trim())
+          .filter((w: string) => w.length > 2);
 
         // Check for exact substring match first (original logic)
         if (categoryLower.includes(genreLower) || genreLower.includes(categoryLower)) {
@@ -303,7 +303,11 @@ router.get("/to-read/:userId", async (req, res) => {
       include: {
         books: {
           include: {
-            book: true, // Include the Book record for googleBooksId
+            book: {
+              include: {
+                genre: true,
+              },
+            }, // Include the Book record + its Genre
           },
           orderBy: {
             addedAt: 'desc' // Most recently added first
@@ -323,6 +327,8 @@ router.get("/to-read/:userId", async (req, res) => {
     const toReadBooks = shelf.books.map(shelfBook => ({
       id: shelfBook.id,
       googleBooksId: shelfBook.book.googleBooksId,
+      genreId: shelfBook.book.genreId ?? null,
+      genreName: shelfBook.book.genre?.name ?? null,
       title: shelfBook.title,
       coverURL: shelfBook.coverURL,
       description: shelfBook.description,
@@ -450,7 +456,11 @@ router.get("/finished/:userId", async (req, res) => {
       include: {
         books: {
           include: {
-            book: true, // Include the Book record for googleBooksId
+            book: {
+              include: {
+                genre: true,
+              },
+            }, // Include the Book record + its Genre
           },
           orderBy: {
             addedAt: 'desc' // Most recently added first
@@ -470,6 +480,8 @@ router.get("/finished/:userId", async (req, res) => {
     const finishedBooks = shelf.books.map(shelfBook => ({
       id: shelfBook.id,
       googleBooksId: shelfBook.book.googleBooksId,
+      genreId: shelfBook.book.genreId ?? null,
+      genreName: shelfBook.book.genre?.name ?? null,
       title: shelfBook.title,
       coverURL: shelfBook.coverURL,
       description: shelfBook.description,
@@ -613,7 +625,11 @@ router.get("/favorites/:userId", async (req, res) => {
       include: {
         books: {
           include: {
-            book: true, // Include the Book record for googleBooksId
+            book: {
+              include: {
+                genre: true,
+              },
+            }, // Include the Book record + its Genre
           },
           orderBy: {
             addedAt: 'desc'
@@ -633,6 +649,8 @@ router.get("/favorites/:userId", async (req, res) => {
     const favoriteBooks = favoritesShelf.books.map(shelfBook => ({
       id: shelfBook.id,
       googleBooksId: shelfBook.book.googleBooksId,
+      genreId: shelfBook.book.genreId ?? null,
+      genreName: shelfBook.book.genre?.name ?? null,
       title: shelfBook.title,
       coverURL: shelfBook.coverURL,
       description: shelfBook.description,
