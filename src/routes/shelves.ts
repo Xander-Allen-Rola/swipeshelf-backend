@@ -426,11 +426,31 @@ router.put("/move-book", authenticateToken, async (req, res) => {
         shelfId: targetShelf.id,
         status: targetShelfName.toLowerCase(),
       },
+      include: {
+        book: {
+          include: {
+            genre: true,
+          },
+        },
+        shelf: true,
+      },
     });
 
+    // Match the response shape used by the shelf fetch endpoints
     res.status(200).json({
       message: `✅ Book moved to ${targetShelfName} shelf`,
-      shelfBook: updatedShelfBook,
+      shelfBook: {
+        id: updatedShelfBook.id,
+        googleBooksId: updatedShelfBook.book.googleBooksId,
+        genreId: updatedShelfBook.book.genreId ?? null,
+        genreName: updatedShelfBook.book.genre?.name ?? null,
+        title: updatedShelfBook.title,
+        coverURL: updatedShelfBook.coverURL,
+        description: updatedShelfBook.description,
+        status: updatedShelfBook.status,
+        addedAt: updatedShelfBook.addedAt,
+        shelfName: updatedShelfBook.shelf.name,
+      },
     });
 
   } catch (err: any) {
@@ -590,9 +610,27 @@ router.post("/add-to-favorites", authenticateToken, async (req, res) => {
           coverURL: b.coverUrl ?? null,
           description: b.description ?? null,
         },
+        include: {
+          book: {
+            include: {
+              genre: true,
+            },
+          },
+        },
       });
 
-      addedBooks.push(shelfBook);
+      // Keep client payload consistent with /favorites, /to-read, /finished
+      addedBooks.push({
+        id: shelfBook.id,
+        googleBooksId: shelfBook.book.googleBooksId,
+        genreId: shelfBook.book.genreId ?? null,
+        genreName: shelfBook.book.genre?.name ?? null,
+        title: shelfBook.title,
+        coverURL: shelfBook.coverURL,
+        description: shelfBook.description,
+        status: shelfBook.status,
+        addedAt: shelfBook.addedAt,
+      });
     }
 
     return res.status(200).json({
