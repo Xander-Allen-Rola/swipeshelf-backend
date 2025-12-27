@@ -19,8 +19,21 @@ type CandidateBook = {
   description: string;
   averageRating: number;
   categories: string[];
-  sourceGenreId?: number;
-  sourceGenreName?: string;
+  // Sent to the frontend: all genres we associate with the recommendation.
+  // (This will be overwritten to the effective multi-genre set at response time.)
+  sourceGenreIds: number[];
+  sourceGenreNames: string[];
+};
+
+type ScoredCandidate = {
+  candidate: CandidateBook;
+  score: number;
+  genreIds: number[];
+  genreScore: number;
+  genreOverlapRatio: number;
+  finishedScore: number;
+  toReadScore: number;
+  weights: { genre: number; finished: number; toRead: number };
 };
 
 type ShelfBookLite = {
@@ -175,6 +188,68 @@ const maxSimilarityToShelfDetailed = (
     }
   }
   return { score: best, matchedIndex };
+};
+
+const countIntersection = (a: Set<number>, b: Set<number>) => {
+  let count = 0;
+  for (const x of a) {
+    if (b.has(x)) count += 1;
+  }
+  return count;
+};
+
+const addSourceGenre = (candidate: CandidateBook, genreId?: number, genreName?: string) => {
+  if (!genreId) return;
+  const ids = new Set<number>(candidate.sourceGenreIds ?? []);
+  ids.add(genreId);
+  candidate.sourceGenreIds = Array.from(ids);
+
+  const names = new Set<string>(candidate.sourceGenreNames ?? []);
+  if (genreName) names.add(genreName);
+  candidate.sourceGenreNames = Array.from(names);
+};
+
+const normalizeForCompare = (value: string) =>
+  value
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, "");
+
+const deriveGenreIdsFromCategories = (
+  categories: string[] | undefined,
+  allGenres: Array<{ id: number; name: string }>
+): Set<number> => {
+  const derived = new Set<number>();
+  if (!categories || categories.length === 0) return derived;
+
+  const normalizedCategories = categories
+    .map((c) => normalizeForCompare(c))
+    .filter(Boolean);
+
+  for (const genre of allGenres) {
+    const normalizedGenreName = normalizeForCompare(genre.name);
+    if (!normalizedGenreName) continue;
+
+    // Split multi-part genre names like "Biography / Memoir" into tokens.
+    const tokens = genre.name
+      .split(/[/,&]|\band\b/i)
+      .map((t) => normalizeForCompare(t))
+      .filter((t) => t.length >= 3);
+    const allNeedles = new Set<string>([normalizedGenreName, ...tokens]);
+
+    for (const cat of normalizedCategories) {
+      for (const needle of allNeedles) {
+        if (!needle) continue;
+        if (cat.includes(needle) || needle.includes(cat)) {
+          derived.add(genre.id);
+          break;
+        }
+      }
+      if (derived.has(genre.id)) break;
+    }
+  }
+
+  return derived;
 };
 
 /** Get books from the "To Read" shelf for a user */
@@ -360,15 +435,19 @@ router.get("/fetch/:userId", async (req, res) => {
 
         const candidate: CandidateBook = {
           ...book,
-          sourceGenreId: ug.genre.id,
-          sourceGenreName: ug.genre.name,
+          sourceGenreIds: [],
+          sourceGenreNames: [],
         };
+        addSourceGenre(candidate, ug.genre.id, ug.genre.name);
         const key = normalizedCandidateKey(candidate);
         const existingCandidate = candidateMap.get(key);
         if (!existingCandidate) {
           candidateMap.set(key, candidate);
           continue;
         }
+
+        // Same book key appeared under another genre query: merge the source genre(s).
+        addSourceGenre(existingCandidate, ug.genre.id, ug.genre.name);
 
         // Collision: same normalized key (likely the same book with different Google Books IDs)
         dedupedCollisions += 1;
@@ -387,6 +466,15 @@ router.get("/fetch/:userId", async (req, res) => {
           (incomingRating === existingRating && incomingDescLen > existingDescLen);
 
         if (shouldReplace) {
+          // Preserve merged source genres when replacing.
+          const mergedSourceIds = new Set<number>(existingCandidate.sourceGenreIds);
+          for (const id of candidate.sourceGenreIds) mergedSourceIds.add(id);
+          candidate.sourceGenreIds = Array.from(mergedSourceIds);
+
+          const mergedSourceNames = new Set<string>(existingCandidate.sourceGenreNames);
+          for (const name of candidate.sourceGenreNames) mergedSourceNames.add(name);
+          candidate.sourceGenreNames = Array.from(mergedSourceNames);
+
           candidateMap.set(key, candidate);
           console.log(
             `   ↳ replaced kept=${existingCandidate.googleBooksId} with=${candidate.googleBooksId} (rating ${existingRating}→${incomingRating}, descLen ${existingDescLen}→${incomingDescLen})`
@@ -403,25 +491,36 @@ router.get("/fetch/:userId", async (req, res) => {
       return res.status(200).json([]);
     }
 
+    // Fetch all genres once so we can map Google categories -> DB genres.
+    const allGenres = await prisma.genre.findMany({ select: { id: true, name: true } });
+
     // 2️⃣ Pull any existing DB genres for candidates (authoritative)
     const existing = await prisma.book.findMany({
       where: { googleBooksId: { in: candidates.map((c) => c.googleBooksId) } },
-      select: { googleBooksId: true, genreId: true },
+      select: {
+        googleBooksId: true,
+        genres: { select: { genreId: true } },
+      },
     });
-    const existingGenreByGoogleId = new Map<string, number | null>(
-      existing.map((b) => [b.googleBooksId, b.genreId ?? null])
+    const existingGenreIdsByGoogleId = new Map<string, Set<number>>(
+      existing.map((b) => [b.googleBooksId, new Set<number>(b.genres.map((g) => g.genreId))])
     );
 
     // 3️⃣ Score candidates
     console.log(`🧮 Scoring ${candidates.length} candidates...`);
 
-    const scored = candidates.map((c) => {
-      const dbGenreId = existingGenreByGoogleId.get(c.googleBooksId) ?? null;
-      const genreId = dbGenreId ?? c.sourceGenreId ?? null;
+    const scored: ScoredCandidate[] = candidates.map((c) => {
+      // DB genres are authoritative; if none exist, fall back to the genre we fetched this candidate from.
+      const dbGenreIds = existingGenreIdsByGoogleId.get(c.googleBooksId) ?? new Set<number>();
 
-      // book.genres is effectively a single-genre list (genreId FK)
-      const totalGenres = genreId ? 1 : 0;
-      const matchedGenres = genreId && preferredGenreIds.has(genreId) ? 1 : 0;
+      const sourceGenreIds = new Set<number>(c.sourceGenreIds ?? []);
+      const categoryGenreIds = deriveGenreIdsFromCategories(c.categories, allGenres);
+
+      const inferredGenreIds = new Set<number>([...sourceGenreIds, ...categoryGenreIds]);
+      const effectiveGenreIds = dbGenreIds.size > 0 ? dbGenreIds : inferredGenreIds;
+
+      const totalGenres = effectiveGenreIds.size;
+      const matchedGenres = countIntersection(effectiveGenreIds, preferredGenreIds);
       const genreOverlapRatio = totalGenres > 0 ? matchedGenres / totalGenres : 0;
       const genreScore = totalGenres > 0 ? 0.6 + 0.4 * genreOverlapRatio : 0;
 
@@ -437,11 +536,11 @@ router.get("/fetch/:userId", async (req, res) => {
         weights.finished * finishedScore +
         weights.toRead * toReadScore;
 
-      const dbVsSource = dbGenreId
-        ? `dbGenreId=${dbGenreId}`
-        : c.sourceGenreId
-          ? `sourceGenreId=${c.sourceGenreId}`
-          : `noGenreId`;
+      const dbVsSource = dbGenreIds.size > 0
+        ? `dbGenreIds=[${Array.from(dbGenreIds).join(",")}]`
+        : inferredGenreIds.size > 0
+          ? `inferredGenreIds=[${Array.from(inferredGenreIds).join(",")}]`
+          : `noGenreIds`;
 
       const finishedMatch =
         finishedDetail.matchedIndex >= 0
@@ -478,7 +577,7 @@ router.get("/fetch/:userId", async (req, res) => {
       return {
         candidate: c,
         score,
-        genreId,
+        genreIds: Array.from(effectiveGenreIds),
         genreScore,
         genreOverlapRatio,
         finishedScore,
@@ -500,32 +599,66 @@ router.get("/fetch/:userId", async (req, res) => {
           `weights(g=${r.weights.genre.toFixed(2)},f=${r.weights.finished.toFixed(2)},t=${r.weights.toRead.toFixed(
             2
           )}) ` +
-          `genreId=${r.genreId ?? "null"} | ${r.candidate.googleBooksId} | "${r.candidate.title}"`
+          `genreIds=[${(r.genreIds ?? []).join(",") || ""}] | ${r.candidate.googleBooksId} | "${r.candidate.title}"`
       );
     });
 
-    // 4️⃣ Persist genreId for returned recommendations
+    // 4️⃣ Persist genres for returned recommendations
     for (const r of top) {
-      if (!r.genreId) continue;
+      const dbGenreIds = existingGenreIdsByGoogleId.get(r.candidate.googleBooksId) ?? new Set<number>();
+
+      const sourceGenreIds = new Set<number>(r.candidate.sourceGenreIds ?? []);
+      const categoryGenreIds = deriveGenreIdsFromCategories(r.candidate.categories, allGenres);
+      const inferredGenreIds = new Set<number>([...sourceGenreIds, ...categoryGenreIds]);
+
+      const genreIdsToPersist = new Set<number>();
+      // Always keep existing DB genres, but also add any newly inferred ones.
+      for (const gid of dbGenreIds) genreIdsToPersist.add(gid);
+      for (const gid of inferredGenreIds) genreIdsToPersist.add(gid);
+
+      if (genreIdsToPersist.size === 0) continue;
+
       try {
-        await prisma.book.upsert({
+        const upserted = await prisma.book.upsert({
           where: { googleBooksId: r.candidate.googleBooksId },
-          create: { googleBooksId: r.candidate.googleBooksId, genreId: r.genreId },
-          update: { genreId: r.genreId },
+          create: { googleBooksId: r.candidate.googleBooksId },
+          update: {},
+        });
+
+        await prisma.bookGenre.createMany({
+          data: Array.from(genreIdsToPersist).map((genreId) => ({
+            bookId: upserted.id,
+            genreId,
+          })),
+          skipDuplicates: true,
         });
         console.log(
-          `💾 Persisted genreId=${r.genreId} for ${r.candidate.googleBooksId} ("${r.candidate.title}")`
+          `💾 Persisted genres=[${Array.from(genreIdsToPersist).join(",")}] for ${r.candidate.googleBooksId} ("${r.candidate.title}")`
         );
       } catch (e) {
         console.warn(
-          `⚠️ Failed to set genreId for book ${r.candidate.googleBooksId}:`,
+          `⚠️ Failed to persist genres for book ${r.candidate.googleBooksId}:`,
           (e as any)?.message
         );
       }
     }
 
     // Keep response shape the same as before (just the book objects)
-    res.status(200).json(top.map((r) => r.candidate));
+    const genreNameById = new Map<number, string>(allGenres.map((g) => [g.id, g.name]));
+    res.status(200).json(
+      top.map((r) => {
+        const sourceGenreIds = Array.from(new Set<number>(r.genreIds ?? [])).sort((a, b) => a - b);
+        const sourceGenreNames = sourceGenreIds
+          .map((id) => genreNameById.get(id))
+          .filter((name): name is string => !!name);
+
+        return {
+          ...r.candidate,
+          sourceGenreIds,
+          sourceGenreNames,
+        } satisfies CandidateBook;
+      })
+    );
   } catch (err: any) {
     console.error(
       "❌ Error fetching recommendations:",

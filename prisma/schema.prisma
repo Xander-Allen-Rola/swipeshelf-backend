@@ -29,7 +29,7 @@ model Genre {
   name   String      @unique
 
   users  UserGenre[]
-  books  Book[]
+  books  BookGenre[]
 }
 
 model UserGenre {
@@ -46,12 +46,23 @@ model UserGenre {
 model Book {
   id            Int     @id @default(autoincrement())
   googleBooksId String  @unique
-  genreId       Int?
-  genre         Genre?  @relation(fields: [genreId], references: [id], onDelete: SetNull)
-  @@index([genreId])
+  genres        BookGenre[]
 
   userBooks     UserBook[]
   shelfBooks    ShelfBook[] 
+}
+
+model BookGenre {
+  id      Int   @id @default(autoincrement())
+  bookId  Int
+  genreId Int
+
+  book    Book  @relation(fields: [bookId], references: [id], onDelete: Cascade)
+  genre   Genre @relation(fields: [genreId], references: [id], onDelete: Cascade)
+
+  @@unique([bookId, genreId])
+  @@index([bookId])
+  @@index([genreId])
 }
 
 model UserBook {
