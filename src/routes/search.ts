@@ -2,90 +2,12 @@ import { Router } from "express";
 import axios from "axios";
 import pLimit from "p-limit";
 import prisma from "../prisma";
+import { matchGenresFromCategories, type GenreLite } from "../utils/genreMatch";
 
 const router = Router();
 const GOOGLE_API_KEY = process.env.GOOGLE_BOOKS_API_KEY;
 const limit = pLimit(5); // max 5 concurrent Open Library requests
-
-type GenreLite = { id: number; name: string };
-
-const tokenizeWords = (value: string) =>
-  String(value)
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, " ")
-    .trim()
-    .split(/\s+/)
-    .filter((t) => t.length >= 3);
-
-const splitGenreParts = (genreName: string) =>
-  genreName
-    .split(/[/,&]|\band\b/i)
-    .map((p) => p.trim())
-    .filter(Boolean);
-
-const isTokenSubset = (a: Set<string>, b: Set<string>) => {
-  for (const t of a) {
-    if (!b.has(t)) return false;
-  }
-  return true;
-};
-
-const matchGenresFromCategories = (
-  categories: string[],
-  genres: GenreLite[]
-): GenreLite[] => {
-  if (!categories?.length || !genres?.length) return [];
-
-  const categoryTokenSets = categories
-    .map((c) => new Set(tokenizeWords(c)))
-    .filter((s) => s.size > 0);
-
-  const matchedById = new Map<number, GenreLite>();
-  const genreTokensById = new Map<number, Set<string>>();
-
-  for (const g of genres) {
-    const fullTokens = new Set(tokenizeWords(g.name));
-    if (fullTokens.size === 0) continue;
-    genreTokensById.set(g.id, fullTokens);
-
-    const parts = splitGenreParts(g.name);
-    const partTokenSets = parts
-      .map((p) => new Set(tokenizeWords(p)))
-      .filter((s) => s.size > 0);
-
-    for (const catTokens of categoryTokenSets) {
-      const matchesThisCategory = partTokenSets.some((genrePartTokens) =>
-        isTokenSubset(genrePartTokens, catTokens)
-      );
-      if (matchesThisCategory) {
-        matchedById.set(g.id, g);
-        break;
-      }
-    }
-  }
-
-  // Prune less-specific matches when a more specific genre is also matched.
-  // Example: If "Science Fiction" matches, do not also return "Fiction".
-  const matched = Array.from(matchedById.values());
-  const matchedIds = matched.map((g) => g.id);
-  const prunedIds = new Set<number>(matchedIds);
-  for (const a of matchedIds) {
-    const aTokens = genreTokensById.get(a);
-    if (!aTokens) continue;
-    for (const b of matchedIds) {
-      if (a === b) continue;
-      const bTokens = genreTokensById.get(b);
-      if (!bTokens) continue;
-      if (aTokens.size >= bTokens.size) continue;
-      if (isTokenSubset(aTokens, bTokens)) {
-        prunedIds.delete(a);
-        break;
-      }
-    }
-  }
-
-  return matched.filter((g) => prunedIds.has(g.id));
-};
+const googleVolumeLimit = pLimit(5); // max 5 concurrent Google volume lookups
 
 // 📝 Truncate Description
 const truncateDescription = (text: string, wordLimit = 150) => {
@@ -122,6 +44,24 @@ const fetchOpenLibraryCover = async (title: string, author: string): Promise<str
 
 const fetchCoverWithLimit = (title: string, author: string) =>
   limit(() => fetchOpenLibraryCover(title, author));
+
+// 📚 Fetch categories from Google Volume-by-ID (more complete than search results)
+const fetchGoogleVolumeCategories = async (googleBooksId: string): Promise<string[]> => {
+  try {
+    const res = await axios.get(
+      `https://www.googleapis.com/books/v1/volumes/${googleBooksId}`,
+      { params: { key: GOOGLE_API_KEY } }
+    );
+    const categories = res.data?.volumeInfo?.categories;
+    return Array.isArray(categories) ? categories : [];
+  } catch (err: any) {
+    // Fall back to categories from the search endpoint if this fails.
+    return [];
+  }
+};
+
+const fetchGoogleVolumeCategoriesWithLimit = (googleBooksId: string) =>
+  googleVolumeLimit(() => fetchGoogleVolumeCategories(googleBooksId));
 
 // 📖 Fetch books from Google API
 const fetchBooksFromGoogle = async (
@@ -161,7 +101,13 @@ const fetchBooksFromGoogle = async (
       const forbidden = ["annotated", "illustrated"];
       if (forbidden.some((w) => meta.title.toLowerCase().includes(w))) return null;
 
-      const matchedGenres = matchGenresFromCategories(meta.categories || [], genres);
+      // Use per-volume categories for matching (aligns with shelves/add-to-* behavior).
+      // If the volume lookup fails, fall back to search-result categories.
+      const volumeCategories = await fetchGoogleVolumeCategoriesWithLimit(meta.id);
+      const categoriesForMatching =
+        volumeCategories.length > 0 ? volumeCategories : (meta.categories || []);
+
+      const matchedGenres = matchGenresFromCategories(categoriesForMatching, genres);
 
       return {
         id: 0,
@@ -173,7 +119,7 @@ const fetchBooksFromGoogle = async (
         googleBooksId: meta.id,
         description: truncateDescription(meta.description, 150),
         averageRating: meta.averageRating,
-        categories: meta.categories,
+        categories: categoriesForMatching,
         sourceGenreIds: matchedGenres.map((g) => g.id),
         sourceGenreNames: matchedGenres.map((g) => g.name),
       };

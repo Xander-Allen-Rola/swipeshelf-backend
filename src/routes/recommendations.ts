@@ -5,6 +5,7 @@ import axios from "axios";
 import pLimit from "p-limit";
 
 const limit = pLimit(5); // max 5 concurrent Open Library requests
+const googleVolumeLimit = pLimit(5); // max 5 concurrent Google volume lookups
 
 const router = Router();
 const GOOGLE_API_KEY = process.env.GOOGLE_BOOKS_API_KEY;
@@ -19,8 +20,10 @@ type CandidateBook = {
   description: string;
   averageRating: number;
   categories: string[];
-  // Sent to the frontend: all genres we associate with the recommendation.
-  // (This will be overwritten to the effective multi-genre set at response time.)
+  // Sent to the frontend: all matched genres for this book (independent of recommendation provenance).
+  genreIds: number[];
+  genreNames: string[];
+  // Sent to the frontend: genres involved in/used by the recommendation process.
   sourceGenreIds: number[];
   sourceGenreNames: string[];
 };
@@ -79,6 +82,23 @@ const fetchOpenLibraryCover = async (title: string, author: string): Promise<str
 // Wrapper to safely fetch with concurrency limit
 const fetchCoverWithLimit = (title: string, author: string) =>
   limit(() => fetchOpenLibraryCover(title, author));
+
+// Fetch categories via volume-by-id (often richer than search results)
+const fetchGoogleVolumeCategories = async (googleBooksId: string): Promise<string[]> => {
+  try {
+    const res = await axios.get(
+      `https://www.googleapis.com/books/v1/volumes/${googleBooksId}`,
+      { params: { key: GOOGLE_API_KEY } }
+    );
+    const categories = res.data?.volumeInfo?.categories;
+    return Array.isArray(categories) ? categories : [];
+  } catch {
+    return [];
+  }
+};
+
+const fetchGoogleVolumeCategoriesWithLimit = (googleBooksId: string) =>
+  googleVolumeLimit(() => fetchGoogleVolumeCategories(googleBooksId));
 
 const fetchBooksFromGoogle = async (query: string, maxResults = 20) => {
   const res = await axios.get("https://www.googleapis.com/books/v1/volumes", {
@@ -467,6 +487,10 @@ router.get("/fetch/:userId", async (req, res) => {
 
         const candidate: CandidateBook = {
           ...book,
+          // Filled at response time.
+          genreIds: [],
+          genreNames: [],
+          // Filled during candidate aggregation + overwritten at response time.
           sourceGenreIds: [],
           sourceGenreNames: [],
         };
@@ -675,22 +699,48 @@ router.get("/fetch/:userId", async (req, res) => {
       }
     }
 
-    // Keep response shape the same as before (just the book objects)
+    // Keep recommendation algorithm unchanged; only enrich the payload with full matched genres for display.
     const genreNameById = new Map<number, string>(allGenres.map((g) => [g.id, g.name]));
-    res.status(200).json(
-      top.map((r) => {
+    const payload = await Promise.all(
+      top.map(async (r) => {
+        // These are the genreIds used for scoring (effectiveGenreIds).
         const sourceGenreIds = Array.from(new Set<number>(r.genreIds ?? [])).sort((a, b) => a - b);
         const sourceGenreNames = sourceGenreIds
           .map((id) => genreNameById.get(id))
           .filter((name): name is string => !!name);
 
+        // These are the genreIds we display: derived from volume-by-id categories (plus any DB genres).
+        const volumeCategories = await fetchGoogleVolumeCategoriesWithLimit(r.candidate.googleBooksId);
+        const dbGenreIds = existingGenreIdsByGoogleId.get(r.candidate.googleBooksId) ?? new Set<number>();
+
+        const volumeDerived = deriveGenreIdsFromCategories(volumeCategories, allGenres);
+        const searchDerived = deriveGenreIdsFromCategories(r.candidate.categories, allGenres);
+        const inferredForDisplay = volumeDerived.size > 0 ? volumeDerived : searchDerived;
+
+        const displayIds = new Set<number>();
+        for (const gid of dbGenreIds) displayIds.add(gid);
+        for (const gid of inferredForDisplay) displayIds.add(gid);
+        if (displayIds.size === 0) {
+          for (const gid of r.candidate.sourceGenreIds ?? []) displayIds.add(gid);
+        }
+
+        const genreIds = Array.from(displayIds).sort((a, b) => a - b);
+        const genreNames = genreIds
+          .map((id) => genreNameById.get(id))
+          .filter((name): name is string => !!name);
+
         return {
           ...r.candidate,
+          categories: volumeCategories.length > 0 ? volumeCategories : r.candidate.categories,
+          genreIds,
+          genreNames,
           sourceGenreIds,
           sourceGenreNames,
         } satisfies CandidateBook;
       })
     );
+
+    res.status(200).json(payload);
   } catch (err: any) {
     console.error(
       "❌ Error fetching recommendations:",

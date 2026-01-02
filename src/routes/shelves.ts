@@ -2,6 +2,7 @@ import { Router } from "express";
 import prisma from "../prisma";
 import jwt from "jsonwebtoken";
 import axios from "axios";
+import { matchGenresFromCategories, type GenreLite } from "../utils/genreMatch";
 
 const router = Router();
 const GOOGLE_API_KEY = process.env.GOOGLE_BOOKS_API_KEY;
@@ -23,7 +24,10 @@ const authenticateToken = (req: any, res: any, next: any) => {
  * Helper: Detect genre for a book by fetching from Google Books API
  * and matching categories to existing Genre records
  */
-const detectBookGenre = async (googleBooksId: string): Promise<number | null> => {
+
+const detectBookGenres = async (
+  googleBooksId: string
+): Promise<{ genreIds: number[]; genreNames: string[] }> => {
   try {
     // Fetch book metadata from Google Books API
     const response = await axios.get(
@@ -34,64 +38,46 @@ const detectBookGenre = async (googleBooksId: string): Promise<number | null> =>
     const categories = response.data.volumeInfo?.categories || [];
     if (categories.length === 0) {
       console.log(`📚 No categories found for book ${googleBooksId}`);
-      return null;
+      return { genreIds: [], genreNames: [] };
     }
 
     console.log(`📚 Book ${googleBooksId} has categories:`, categories);
 
     // Fetch all genres from database
-    const genres = await prisma.genre.findMany();
+    const genres: GenreLite[] = await prisma.genre.findMany({ select: { id: true, name: true } });
     if (genres.length === 0) {
       console.warn(`⚠️ No genres found in database`);
-      return null;
+      return { genreIds: [], genreNames: [] };
     }
 
-    // Try to match a category to a genre (case-insensitive)
-    for (const category of categories) {
-      const categoryLower = category.toLowerCase();
-      
-      // Extract key words from category (split on common separators)
-      const categoryWords = categoryLower
-        .split(/[\/&\-,]/)
-        .map((w: string) => w.trim())
-        .filter((w: string) => w.length > 2); // ignore short words like "of", "a", etc.
-
-      const matchedGenre = genres.find((g) => {
-        const genreLower = g.name.toLowerCase();
-        const genreWords = genreLower
-          .split(/[\/&\-,]/)
-          .map((w: string) => w.trim())
-          .filter((w: string) => w.length > 2);
-
-        // Check for exact substring match first (original logic)
-        if (categoryLower.includes(genreLower) || genreLower.includes(categoryLower)) {
-          return true;
-        }
-
-        // Check if any genre word appears in any category word
-        for (const genreWord of genreWords) {
-          for (const categoryWord of categoryWords) {
-            if (categoryWord.includes(genreWord) || genreWord.includes(categoryWord)) {
-              return true;
-            }
-          }
-        }
-
-        return false;
-      });
-
-      if (matchedGenre) {
-        console.log(`✅ Matched genre "${matchedGenre.name}" (ID: ${matchedGenre.id}) for category "${category}"`);
-        return matchedGenre.id;
-      }
+    const matched = matchGenresFromCategories(categories, genres);
+    if (matched.length === 0) {
+      console.log(`❌ No genre match found for book ${googleBooksId}. Categories:`, categories);
+      return { genreIds: [], genreNames: [] };
     }
 
-    console.log(`❌ No genre match found for book ${googleBooksId}. Categories:`, categories);
-    return null;
+    console.log(
+      `✅ Matched genres for ${googleBooksId}: ${matched.map((m) => `${m.name}#${m.id}`).join(", ")}`
+    );
+
+    return { genreIds: matched.map((m) => m.id), genreNames: matched.map((m) => m.name) };
   } catch (err: any) {
     console.warn(`⚠️ Failed to detect genre for ${googleBooksId}:`, err?.message);
-    return null;
+    return { genreIds: [], genreNames: [] };
   }
+};
+
+const bookGenreMeta = (book: any) => {
+  const genreNames: string[] =
+    book?.genres?.map((bg: any) => bg?.genre?.name).filter(Boolean) ?? [];
+  const genreIds: number[] =
+    book?.genres?.map((bg: any) => bg?.genreId).filter((v: any) => typeof v === "number") ?? [];
+  return {
+    genreIds,
+    genreNames,
+    genreId: genreIds[0] ?? null,
+    genreName: genreNames[0] ?? null,
+  };
 };
 
 /**
@@ -120,26 +106,41 @@ router.post("/add-to-to-read", authenticateToken, async (req, res) => {
     // 2️⃣ Find or create the book with genre detection
     let dbBook = await prisma.book.findUnique({
       where: { googleBooksId: book.googleBooksId },
+      include: { genres: { include: { genre: true } } },
     });
 
     if (!dbBook) {
-      // Detect genre from Google Books API
-      const genreId = await detectBookGenre(book.googleBooksId);
+      const detected = await detectBookGenres(book.googleBooksId);
       dbBook = await prisma.book.create({
-        data: { 
-          googleBooksId: book.googleBooksId,
-          genreId: genreId,
-        },
+        data: { googleBooksId: book.googleBooksId },
+        include: { genres: { include: { genre: true } } },
       });
-    } else if (!dbBook.genreId) {
-      // If book exists but has no genre, try to set it
-      const genreId = await detectBookGenre(book.googleBooksId);
-      if (genreId) {
-        dbBook = await prisma.book.update({
+      if (detected.genreIds.length > 0) {
+        await prisma.bookGenre.createMany({
+          data: detected.genreIds.map((genreId) => ({ bookId: dbBook!.id, genreId })),
+          skipDuplicates: true,
+        });
+        dbBook = await prisma.book.findUnique({
           where: { id: dbBook.id },
-          data: { genreId },
+          include: { genres: { include: { genre: true } } },
         });
       }
+    } else if ((dbBook.genres?.length ?? 0) === 0) {
+      const detected = await detectBookGenres(book.googleBooksId);
+      if (detected.genreIds.length > 0) {
+        await prisma.bookGenre.createMany({
+          data: detected.genreIds.map((genreId) => ({ bookId: dbBook!.id, genreId })),
+          skipDuplicates: true,
+        });
+        dbBook = await prisma.book.findUnique({
+          where: { id: dbBook.id },
+          include: { genres: { include: { genre: true } } },
+        });
+      }
+    }
+
+    if (!dbBook) {
+      return res.status(500).json({ error: "Failed to resolve book record" });
     }
 
     // 3️⃣ Check if the book is in "Finished" shelf
@@ -216,26 +217,41 @@ router.post("/add-to-finished", authenticateToken, async (req, res) => {
     // 2️⃣ Find or create the book with genre detection
     let dbBook = await prisma.book.findUnique({
       where: { googleBooksId: book.googleBooksId },
+      include: { genres: { include: { genre: true } } },
     });
 
     if (!dbBook) {
-      // Detect genre from Google Books API
-      const genreId = await detectBookGenre(book.googleBooksId);
+      const detected = await detectBookGenres(book.googleBooksId);
       dbBook = await prisma.book.create({
-        data: { 
-          googleBooksId: book.googleBooksId,
-          genreId: genreId,
-        },
+        data: { googleBooksId: book.googleBooksId },
+        include: { genres: { include: { genre: true } } },
       });
-    } else if (!dbBook.genreId) {
-      // If book exists but has no genre, try to set it
-      const genreId = await detectBookGenre(book.googleBooksId);
-      if (genreId) {
-        dbBook = await prisma.book.update({
+      if (detected.genreIds.length > 0) {
+        await prisma.bookGenre.createMany({
+          data: detected.genreIds.map((genreId) => ({ bookId: dbBook!.id, genreId })),
+          skipDuplicates: true,
+        });
+        dbBook = await prisma.book.findUnique({
           where: { id: dbBook.id },
-          data: { genreId },
+          include: { genres: { include: { genre: true } } },
         });
       }
+    } else if ((dbBook.genres?.length ?? 0) === 0) {
+      const detected = await detectBookGenres(book.googleBooksId);
+      if (detected.genreIds.length > 0) {
+        await prisma.bookGenre.createMany({
+          data: detected.genreIds.map((genreId) => ({ bookId: dbBook!.id, genreId })),
+          skipDuplicates: true,
+        });
+        dbBook = await prisma.book.findUnique({
+          where: { id: dbBook.id },
+          include: { genres: { include: { genre: true } } },
+        });
+      }
+    }
+
+    if (!dbBook) {
+      return res.status(500).json({ error: "Failed to resolve book record" });
     }
 
     // 3️⃣ Check if the book is in "To Read" shelf
@@ -305,7 +321,7 @@ router.get("/to-read/:userId", async (req, res) => {
           include: {
             book: {
               include: {
-                genre: true,
+                genres: { include: { genre: true } },
               },
             }, // Include the Book record + its Genre
           },
@@ -327,8 +343,7 @@ router.get("/to-read/:userId", async (req, res) => {
     const toReadBooks = shelf.books.map(shelfBook => ({
       id: shelfBook.id,
       googleBooksId: shelfBook.book.googleBooksId,
-      genreId: shelfBook.book.genreId ?? null,
-      genreName: shelfBook.book.genre?.name ?? null,
+      ...bookGenreMeta(shelfBook.book),
       title: shelfBook.title,
       coverURL: shelfBook.coverURL,
       description: shelfBook.description,
@@ -429,7 +444,7 @@ router.put("/move-book", authenticateToken, async (req, res) => {
       include: {
         book: {
           include: {
-            genre: true,
+            genres: { include: { genre: true } },
           },
         },
         shelf: true,
@@ -442,8 +457,7 @@ router.put("/move-book", authenticateToken, async (req, res) => {
       shelfBook: {
         id: updatedShelfBook.id,
         googleBooksId: updatedShelfBook.book.googleBooksId,
-        genreId: updatedShelfBook.book.genreId ?? null,
-        genreName: updatedShelfBook.book.genre?.name ?? null,
+        ...bookGenreMeta(updatedShelfBook.book),
         title: updatedShelfBook.title,
         coverURL: updatedShelfBook.coverURL,
         description: updatedShelfBook.description,
@@ -478,7 +492,7 @@ router.get("/finished/:userId", async (req, res) => {
           include: {
             book: {
               include: {
-                genre: true,
+                genres: { include: { genre: true } },
               },
             }, // Include the Book record + its Genre
           },
@@ -500,8 +514,7 @@ router.get("/finished/:userId", async (req, res) => {
     const finishedBooks = shelf.books.map(shelfBook => ({
       id: shelfBook.id,
       googleBooksId: shelfBook.book.googleBooksId,
-      genreId: shelfBook.book.genreId ?? null,
-      genreName: shelfBook.book.genre?.name ?? null,
+      ...bookGenreMeta(shelfBook.book),
       title: shelfBook.title,
       coverURL: shelfBook.coverURL,
       description: shelfBook.description,
@@ -566,27 +579,40 @@ router.post("/add-to-favorites", authenticateToken, async (req, res) => {
       // 🪄 Find or create the book with genre detection
       let dbBook = await prisma.book.findUnique({
         where: { googleBooksId: b.googleBooksId },
+        include: { genres: { include: { genre: true } } },
       });
 
       if (!dbBook) {
-        // Detect genre from Google Books API
-        const genreId = await detectBookGenre(b.googleBooksId);
+        const detected = await detectBookGenres(b.googleBooksId);
         dbBook = await prisma.book.create({
-          data: {
-            googleBooksId: b.googleBooksId,
-            genreId: genreId,
-          },
+          data: { googleBooksId: b.googleBooksId },
+          include: { genres: { include: { genre: true } } },
         });
-      } else if (!dbBook.genreId) {
-        // If book exists but has no genre, try to set it
-        const genreId = await detectBookGenre(b.googleBooksId);
-        if (genreId) {
-          dbBook = await prisma.book.update({
+        if (detected.genreIds.length > 0) {
+          await prisma.bookGenre.createMany({
+            data: detected.genreIds.map((genreId) => ({ bookId: dbBook!.id, genreId })),
+            skipDuplicates: true,
+          });
+          dbBook = await prisma.book.findUnique({
             where: { id: dbBook.id },
-            data: { genreId },
+            include: { genres: { include: { genre: true } } },
+          });
+        }
+      } else if ((dbBook.genres?.length ?? 0) === 0) {
+        const detected = await detectBookGenres(b.googleBooksId);
+        if (detected.genreIds.length > 0) {
+          await prisma.bookGenre.createMany({
+            data: detected.genreIds.map((genreId) => ({ bookId: dbBook!.id, genreId })),
+            skipDuplicates: true,
+          });
+          dbBook = await prisma.book.findUnique({
+            where: { id: dbBook.id },
+            include: { genres: { include: { genre: true } } },
           });
         }
       }
+
+      if (!dbBook) continue;
 
       // 4️⃣ Upsert into shelfBook
       const shelfBook = await prisma.shelfBook.upsert({
@@ -613,7 +639,7 @@ router.post("/add-to-favorites", authenticateToken, async (req, res) => {
         include: {
           book: {
             include: {
-              genre: true,
+              genres: { include: { genre: true } },
             },
           },
         },
@@ -623,8 +649,7 @@ router.post("/add-to-favorites", authenticateToken, async (req, res) => {
       addedBooks.push({
         id: shelfBook.id,
         googleBooksId: shelfBook.book.googleBooksId,
-        genreId: shelfBook.book.genreId ?? null,
-        genreName: shelfBook.book.genre?.name ?? null,
+        ...bookGenreMeta(shelfBook.book),
         title: shelfBook.title,
         coverURL: shelfBook.coverURL,
         description: shelfBook.description,
@@ -665,7 +690,7 @@ router.get("/favorites/:userId", async (req, res) => {
           include: {
             book: {
               include: {
-                genre: true,
+                genres: { include: { genre: true } },
               },
             }, // Include the Book record + its Genre
           },
@@ -687,8 +712,7 @@ router.get("/favorites/:userId", async (req, res) => {
     const favoriteBooks = favoritesShelf.books.map(shelfBook => ({
       id: shelfBook.id,
       googleBooksId: shelfBook.book.googleBooksId,
-      genreId: shelfBook.book.genreId ?? null,
-      genreName: shelfBook.book.genre?.name ?? null,
+      ...bookGenreMeta(shelfBook.book),
       title: shelfBook.title,
       coverURL: shelfBook.coverURL,
       description: shelfBook.description,
