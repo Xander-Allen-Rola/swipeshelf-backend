@@ -209,11 +209,26 @@ const addSourceGenre = (candidate: CandidateBook, genreId?: number, genreName?: 
   candidate.sourceGenreNames = Array.from(names);
 };
 
-const normalizeForCompare = (value: string) =>
-  value
+const tokenizeWords = (value: string) =>
+  String(value)
     .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
     .trim()
-    .replace(/[^a-z0-9]+/g, "");
+    .split(/\s+/)
+    .filter((t) => t.length >= 3);
+
+const splitGenreParts = (genreName: string) =>
+  genreName
+    .split(/[/,&]|\band\b/i)
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+const isTokenSubset = (a: Set<string>, b: Set<string>) => {
+  for (const t of a) {
+    if (!b.has(t)) return false;
+  }
+  return true;
+};
 
 const deriveGenreIdsFromCategories = (
   categories: string[] | undefined,
@@ -222,33 +237,50 @@ const deriveGenreIdsFromCategories = (
   const derived = new Set<number>();
   if (!categories || categories.length === 0) return derived;
 
-  const normalizedCategories = categories
-    .map((c) => normalizeForCompare(c))
-    .filter(Boolean);
+  const categoryTokenSets = categories
+    .map((c) => new Set(tokenizeWords(c)))
+    .filter((s) => s.size > 0);
+
+  const matched: Array<{ id: number; tokens: Set<string> }> = [];
 
   for (const genre of allGenres) {
-    const normalizedGenreName = normalizeForCompare(genre.name);
-    if (!normalizedGenreName) continue;
+    const fullTokens = new Set(tokenizeWords(genre.name));
+    if (fullTokens.size === 0) continue;
 
-    // Split multi-part genre names like "Biography / Memoir" into tokens.
-    const tokens = genre.name
-      .split(/[/,&]|\band\b/i)
-      .map((t) => normalizeForCompare(t))
-      .filter((t) => t.length >= 3);
-    const allNeedles = new Set<string>([normalizedGenreName, ...tokens]);
+    const parts = splitGenreParts(genre.name);
+    const partTokenSets = parts
+      .map((p) => new Set(tokenizeWords(p)))
+      .filter((s) => s.size > 0);
 
-    for (const cat of normalizedCategories) {
-      for (const needle of allNeedles) {
-        if (!needle) continue;
-        if (cat.includes(needle) || needle.includes(cat)) {
-          derived.add(genre.id);
-          break;
-        }
-      }
-      if (derived.has(genre.id)) break;
+    const matchedAnyCategory = categoryTokenSets.some((catTokens) =>
+      partTokenSets.some((genrePartTokens) => isTokenSubset(genrePartTokens, catTokens))
+    );
+
+    if (matchedAnyCategory) {
+      matched.push({ id: genre.id, tokens: fullTokens });
     }
   }
 
+  // Prune less-specific matches when a more specific genre is also matched.
+  const matchedIds = matched.map((m) => m.id);
+  const tokensById = new Map<number, Set<string>>(matched.map((m) => [m.id, m.tokens]));
+  const prunedIds = new Set<number>(matchedIds);
+  for (const a of matchedIds) {
+    const aTokens = tokensById.get(a);
+    if (!aTokens) continue;
+    for (const b of matchedIds) {
+      if (a === b) continue;
+      const bTokens = tokensById.get(b);
+      if (!bTokens) continue;
+      if (aTokens.size >= bTokens.size) continue;
+      if (isTokenSubset(aTokens, bTokens)) {
+        prunedIds.delete(a);
+        break;
+      }
+    }
+  }
+
+  for (const id of prunedIds) derived.add(id);
   return derived;
 };
 

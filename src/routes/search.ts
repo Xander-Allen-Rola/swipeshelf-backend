@@ -9,47 +9,82 @@ const limit = pLimit(5); // max 5 concurrent Open Library requests
 
 type GenreLite = { id: number; name: string };
 
-const matchGenreFromCategories = (
+const tokenizeWords = (value: string) =>
+  String(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .split(/\s+/)
+    .filter((t) => t.length >= 3);
+
+const splitGenreParts = (genreName: string) =>
+  genreName
+    .split(/[/,&]|\band\b/i)
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+const isTokenSubset = (a: Set<string>, b: Set<string>) => {
+  for (const t of a) {
+    if (!b.has(t)) return false;
+  }
+  return true;
+};
+
+const matchGenresFromCategories = (
   categories: string[],
   genres: GenreLite[]
-): GenreLite | null => {
-  if (!categories?.length || !genres?.length) return null;
+): GenreLite[] => {
+  if (!categories?.length || !genres?.length) return [];
 
-  for (const category of categories) {
-    const categoryLower = String(category).toLowerCase();
-    const categoryWords = categoryLower
-      .split(/[\/&\-,]/)
-      .map((w) => w.trim())
-      .filter((w) => w.length > 2);
+  const categoryTokenSets = categories
+    .map((c) => new Set(tokenizeWords(c)))
+    .filter((s) => s.size > 0);
 
-    const matchedGenre = genres.find((g) => {
-      const genreLower = g.name.toLowerCase();
-      const genreWords = genreLower
-        .split(/[\/&\-,]/)
-        .map((w) => w.trim())
-        .filter((w) => w.length > 2);
+  const matchedById = new Map<number, GenreLite>();
+  const genreTokensById = new Map<number, Set<string>>();
 
-      // Exact substring match
-      if (categoryLower.includes(genreLower) || genreLower.includes(categoryLower)) {
-        return true;
+  for (const g of genres) {
+    const fullTokens = new Set(tokenizeWords(g.name));
+    if (fullTokens.size === 0) continue;
+    genreTokensById.set(g.id, fullTokens);
+
+    const parts = splitGenreParts(g.name);
+    const partTokenSets = parts
+      .map((p) => new Set(tokenizeWords(p)))
+      .filter((s) => s.size > 0);
+
+    for (const catTokens of categoryTokenSets) {
+      const matchesThisCategory = partTokenSets.some((genrePartTokens) =>
+        isTokenSubset(genrePartTokens, catTokens)
+      );
+      if (matchesThisCategory) {
+        matchedById.set(g.id, g);
+        break;
       }
-
-      // Word overlap-ish match
-      for (const genreWord of genreWords) {
-        for (const categoryWord of categoryWords) {
-          if (categoryWord.includes(genreWord) || genreWord.includes(categoryWord)) {
-            return true;
-          }
-        }
-      }
-
-      return false;
-    });
-
-    if (matchedGenre) return matchedGenre;
+    }
   }
 
-  return null;
+  // Prune less-specific matches when a more specific genre is also matched.
+  // Example: If "Science Fiction" matches, do not also return "Fiction".
+  const matched = Array.from(matchedById.values());
+  const matchedIds = matched.map((g) => g.id);
+  const prunedIds = new Set<number>(matchedIds);
+  for (const a of matchedIds) {
+    const aTokens = genreTokensById.get(a);
+    if (!aTokens) continue;
+    for (const b of matchedIds) {
+      if (a === b) continue;
+      const bTokens = genreTokensById.get(b);
+      if (!bTokens) continue;
+      if (aTokens.size >= bTokens.size) continue;
+      if (isTokenSubset(aTokens, bTokens)) {
+        prunedIds.delete(a);
+        break;
+      }
+    }
+  }
+
+  return matched.filter((g) => prunedIds.has(g.id));
 };
 
 // 📝 Truncate Description
@@ -126,9 +161,10 @@ const fetchBooksFromGoogle = async (
       const forbidden = ["annotated", "illustrated"];
       if (forbidden.some((w) => meta.title.toLowerCase().includes(w))) return null;
 
-      const matchedGenre = matchGenreFromCategories(meta.categories || [], genres);
+      const matchedGenres = matchGenresFromCategories(meta.categories || [], genres);
 
       return {
+        id: 0,
         title: meta.title,
         authors: meta.authorsList.join(", ") || "Unknown",
         publishedDate: meta.publishedDate ? new Date(meta.publishedDate) : null,
@@ -138,8 +174,8 @@ const fetchBooksFromGoogle = async (
         description: truncateDescription(meta.description, 150),
         averageRating: meta.averageRating,
         categories: meta.categories,
-        sourceGenreId: matchedGenre?.id ?? null,
-        sourceGenreName: matchedGenre?.name ?? null,
+        sourceGenreIds: matchedGenres.map((g) => g.id),
+        sourceGenreNames: matchedGenres.map((g) => g.name),
       };
     })
   );
@@ -172,7 +208,33 @@ router.get("/search", async (req, res) => {
   try {
     const genres = await prisma.genre.findMany({ select: { id: true, name: true } });
     const books = await fetchBooksFromGoogle(query, 20, genres);
-    res.json(books);
+
+    // Overlay with DB-authoritative genres (BookGenre) + known book id when present.
+    const existing = await prisma.book.findMany({
+      where: { googleBooksId: { in: books.map((b) => b.googleBooksId) } },
+      select: {
+        id: true,
+        googleBooksId: true,
+        genres: { select: { genreId: true, genre: { select: { name: true } } } },
+      },
+    });
+    const existingByGoogleId = new Map(
+      existing.map((b) => [b.googleBooksId, b])
+    );
+
+    const merged = books.map((b) => {
+      const db = existingByGoogleId.get(b.googleBooksId);
+      if (!db || db.genres.length === 0) return b;
+
+      return {
+        ...b,
+        id: db.id,
+        sourceGenreIds: db.genres.map((g) => g.genreId),
+        sourceGenreNames: db.genres.map((g) => g.genre.name),
+      };
+    });
+
+    res.json(merged);
   } catch (err: any) {
     console.error("❌ Search error:", err.message);
     res.status(500).json({ error: "Failed to fetch search results" });
