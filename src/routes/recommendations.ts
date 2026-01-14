@@ -218,6 +218,14 @@ const countIntersection = (a: Set<number>, b: Set<number>) => {
   return count;
 };
 
+const setUnionSize = (a: Set<number>, b: Set<number>) => a.size + b.size - countIntersection(a, b);
+
+const genreSignature = (genreIds: number[]) => {
+  if (!genreIds || genreIds.length === 0) return "none";
+  const sorted = Array.from(new Set(genreIds)).sort((x, y) => x - y);
+  return sorted.join("-");
+};
+
 const addSourceGenre = (candidate: CandidateBook, genreId?: number, genreName?: string) => {
   if (!genreId) return;
   const ids = new Set<number>(candidate.sourceGenreIds ?? []);
@@ -575,10 +583,12 @@ router.get("/fetch/:userId", async (req, res) => {
       const inferredGenreIds = new Set<number>([...sourceGenreIds, ...categoryGenreIds]);
       const effectiveGenreIds = dbGenreIds.size > 0 ? dbGenreIds : inferredGenreIds;
 
-      const totalGenres = effectiveGenreIds.size;
+      // Genre similarity: Jaccard similarity avoids over-rewarding books with fewer genres.
+      // |bookGenres ∩ preferred| / |bookGenres ∪ preferred|
       const matchedGenres = countIntersection(effectiveGenreIds, preferredGenreIds);
-      const genreOverlapRatio = totalGenres > 0 ? matchedGenres / totalGenres : 0;
-      const genreScore = totalGenres > 0 ? 0.6 + 0.4 * genreOverlapRatio : 0;
+      const unionGenres = setUnionSize(effectiveGenreIds, preferredGenreIds);
+      const genreOverlapRatio = unionGenres > 0 ? matchedGenres / unionGenres : 0;
+      const genreScore = genreOverlapRatio;
 
       const candidateTokens = tokenize(bookToText(c));
       const finishedDetail = maxSimilarityToShelfDetailed(candidateTokens, finishedTokenSets);
@@ -611,7 +621,7 @@ router.get("/fetch/:userId", async (req, res) => {
       const key = normalizedCandidateKey(c);
       console.log(
         `🧾 Score breakdown | key="${key}" | ${c.googleBooksId} | "${c.title}" | ${dbVsSource} | ` +
-          `genreOverlap=${matchedGenres}/${totalGenres}=${genreOverlapRatio.toFixed(2)} ` +
+          `genreJaccard=${matchedGenres}/${unionGenres}=${genreOverlapRatio.toFixed(2)} ` +
           `genreScore=${genreScore.toFixed(3)} finishedScore=${finishedScore.toFixed(3)} toReadScore=${toReadScore.toFixed(
             3
           )} | ` +
@@ -633,7 +643,7 @@ router.get("/fetch/:userId", async (req, res) => {
       return {
         candidate: c,
         score,
-        genreIds: Array.from(effectiveGenreIds),
+        genreIds: Array.from(effectiveGenreIds).sort((a, b) => a - b),
         genreScore,
         genreOverlapRatio,
         finishedScore,
@@ -643,7 +653,33 @@ router.get("/fetch/:userId", async (req, res) => {
     });
 
     scored.sort((a, b) => b.score - a.score);
-    const top = scored.slice(0, 20);
+
+    // Diversity-aware rerank: apply a small penalty when the same genre combination repeats.
+    // This does NOT change the underlying weighted scoring; it only affects ordering/selection.
+    const DIVERSITY_PENALTY = 0.03;
+    const POOL_SIZE = 80;
+    const pool = scored.slice(0, Math.min(POOL_SIZE, scored.length));
+    const signatureCounts = new Map<string, number>();
+
+    const top: ScoredCandidate[] = [];
+    while (top.length < 20 && pool.length > 0) {
+      let bestIdx = 0;
+      let bestAdjusted = -Infinity;
+      for (let i = 0; i < pool.length; i += 1) {
+        const sig = genreSignature(pool[i]!.genreIds);
+        const count = signatureCounts.get(sig) ?? 0;
+        const adjusted = pool[i]!.score - DIVERSITY_PENALTY * count;
+        if (adjusted > bestAdjusted) {
+          bestAdjusted = adjusted;
+          bestIdx = i;
+        }
+      }
+
+      const picked = pool.splice(bestIdx, 1)[0]!;
+      top.push(picked);
+      const sig = genreSignature(picked.genreIds);
+      signatureCounts.set(sig, (signatureCounts.get(sig) ?? 0) + 1);
+    }
 
     console.log(`🏁 Top ${top.length} recommendations:`);
     top.forEach((r, idx) => {
