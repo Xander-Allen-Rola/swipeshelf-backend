@@ -38,8 +38,8 @@ router.post("/register", async (req, res) => {
     // 🔑 Generate JWT for the newly registered user
     const token = jwt.sign(
       { userId: newUser.id },
-      process.env.JWT_SECRET as string,
-      { expiresIn: "7d" } // optional: adjust expiry as needed
+      JWT_SECRET,
+      { expiresIn: 604800 } // 7 days in seconds (7 * 24 * 60 * 60)
     );
 
     res.status(201).json({
