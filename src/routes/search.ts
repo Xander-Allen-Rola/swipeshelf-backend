@@ -6,7 +6,6 @@ import { matchGenresFromCategories, type GenreLite } from "../utils/genreMatch";
 
 const router = Router();
 const GOOGLE_API_KEY = process.env.GOOGLE_BOOKS_API_KEY;
-const limit = pLimit(5); // max 5 concurrent Open Library requests
 const googleVolumeLimit = pLimit(5); // max 5 concurrent Google volume lookups
 
 // 📝 Truncate Description
@@ -17,33 +16,6 @@ const truncateDescription = (text: string, wordLimit = 150) => {
     ? text
     : words.slice(0, wordLimit).join(" ") + " ...";
 };
-
-// 📚 Fetch cover from Open Library (NO CACHING)
-const fetchOpenLibraryCover = async (title: string, author: string): Promise<string | null> => {
-  try {
-    const res = await axios.get("https://openlibrary.org/search.json", {
-      params: { title, author, limit: 1 },
-    });
-
-    const docs = res.data.docs;
-    if (!docs || !docs.length) return null;
-
-    const bookWithCover = docs.find((doc: any) => doc.cover_i);
-    if (bookWithCover) {
-      return `https://covers.openlibrary.org/b/id/${bookWithCover.cover_i}-L.jpg`;
-    }
-
-    return null;
-  } catch (err: any) {
-    if (err.response?.status === 429) {
-      console.warn(`⚠️ Open Library rate limit hit for "${title}" by "${author}".`);
-    }
-    return null;
-  }
-};
-
-const fetchCoverWithLimit = (title: string, author: string) =>
-  limit(() => fetchOpenLibraryCover(title, author));
 
 // 📚 Fetch categories from Google Volume-by-ID (more complete than search results)
 const fetchGoogleVolumeCategories = async (googleBooksId: string): Promise<string[]> => {
@@ -86,6 +58,7 @@ const fetchBooksFromGoogle = async (
       description: item.volumeInfo.description || "",
       averageRating: item.volumeInfo.averageRating || 0,
       categories: item.volumeInfo.categories || [],
+      imageLinks: item.volumeInfo.imageLinks,
       isbn:
         item.volumeInfo.industryIdentifiers?.find(
           (id: any) => id.type === "ISBN_13"
@@ -95,7 +68,11 @@ const fetchBooksFromGoogle = async (
   // Fetch covers in parallel
   const books = await Promise.all(
     metadata.map(async (meta: any) => {
-      const coverUrl = await fetchCoverWithLimit(meta.title, meta.authorsList[0] || "");
+      let coverUrl = meta.imageLinks?.thumbnail || meta.imageLinks?.smallThumbnail || null;
+      if (coverUrl && coverUrl.startsWith("http:")) {
+        coverUrl = coverUrl.replace("http:", "https:");
+      }
+      
       if (!coverUrl || !meta.description) return null;
 
       const forbidden = ["annotated", "illustrated"];

@@ -4,7 +4,6 @@ import axios from "axios";
 
 import pLimit from "p-limit";
 
-const limit = pLimit(5); // max 5 concurrent Open Library requests
 const googleVolumeLimit = pLimit(5); // max 5 concurrent Google volume lookups
 
 const router = Router();
@@ -53,35 +52,8 @@ const truncateDescription = (text: string, wordLimit = 150) => {
   return words.slice(0, wordLimit).join(" ") + " ...";
 };
 
-// Helper: fetch first Open Library cover by title + author
-const fetchOpenLibraryCover = async (title: string, author: string): Promise<string | null> => {
-  try {
-    const res = await axios.get("https://openlibrary.org/search.json", {
-      params: { title, author, limit: 1 },
-    });
 
-    const docs = res.data.docs;
-    if (!docs || !docs.length) return null;
-
-    const bookWithCover = docs.find((doc: any) => doc.cover_i);
-    if (bookWithCover) {
-      return `https://covers.openlibrary.org/b/id/${bookWithCover.cover_i}-L.jpg`;
-    }
-
-    return null;
-  } catch (err: any) {
-    if (err.response?.status === 429) {
-      console.warn(`⚠️ Open Library rate limit hit for "${title}" by "${author}".`);
-    } else {
-      //console.error("❌ Error fetching Open Library cover:", err?.response?.data || err.message || err);
-    }
-    return null;
-  }
-};
-
-// Wrapper to safely fetch with concurrency limit
-const fetchCoverWithLimit = (title: string, author: string) =>
-  limit(() => fetchOpenLibraryCover(title, author));
+// Helper: truncate description to N words
 
 // Fetch categories via volume-by-id (often richer than search results)
 const fetchGoogleVolumeCategories = async (googleBooksId: string): Promise<string[]> => {
@@ -107,10 +79,12 @@ const fetchBooksFromGoogle = async (query: string, maxResults = 20) => {
 
   const books = await Promise.all(
     res.data.items?.map(async (item: any) => {
-      const coverUrl = await fetchCoverWithLimit(
-        item.volumeInfo.title,
-        item.volumeInfo.authors?.[0] || ""
-      );
+      let coverUrl = item.volumeInfo.imageLinks?.thumbnail || item.volumeInfo.imageLinks?.smallThumbnail || null;
+
+      // Ensure HTTPS
+      if (coverUrl && coverUrl.startsWith("http:")) {
+        coverUrl = coverUrl.replace("http:", "https:");
+      }
 
       let description = item.volumeInfo.description || null;
       if (!coverUrl || !description) return null; // exclude books missing essential info
@@ -481,7 +455,7 @@ router.get("/fetch/:userId", async (req, res) => {
     let skippedMissingId = 0;
     let dedupedCollisions = 0;
     for (const ug of userGenres) {
-      const rawBooks = (await fetchBooksFromGoogle(`subject:${ug.genre.name}`, 40)) as CandidateBook[];
+      const rawBooks = (await fetchBooksFromGoogle(`subject:${ug.genre.name}`, 10)) as CandidateBook[];
       fetchedTotal += rawBooks.length;
       for (const book of rawBooks) {
         if (!book?.googleBooksId) {
@@ -657,12 +631,12 @@ router.get("/fetch/:userId", async (req, res) => {
     // Diversity-aware rerank: apply a small penalty when the same genre combination repeats.
     // This does NOT change the underlying weighted scoring; it only affects ordering/selection.
     const DIVERSITY_PENALTY = 0.03;
-    const POOL_SIZE = 80;
+    const POOL_SIZE = 20;
     const pool = scored.slice(0, Math.min(POOL_SIZE, scored.length));
     const signatureCounts = new Map<string, number>();
 
     const top: ScoredCandidate[] = [];
-    while (top.length < 20 && pool.length > 0) {
+    while (top.length < 5 && pool.length > 0) {
       let bestIdx = 0;
       let bestAdjusted = -Infinity;
       for (let i = 0; i < pool.length; i += 1) {
